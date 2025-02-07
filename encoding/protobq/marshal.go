@@ -39,14 +39,33 @@ func (o MarshalOptions) Marshal(msg proto.Message) (map[string]bigquery.Value, e
 // marshalMessage marshals the given protoreflect.Message.
 func (o MarshalOptions) marshalMessage(msg protoreflect.Message) (map[string]bigquery.Value, error) {
 	result := make(map[string]bigquery.Value, msg.Descriptor().Fields().Len())
-	var returnErr error
-	msg.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+
+	fields := msg.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		value := msg.Get(field)
+
+		// Skip fields that are part of a oneof unless they're the active one
+		if oneof := field.ContainingOneof(); oneof != nil {
+			if msg.WhichOneof(oneof) != field {
+				continue
+			}
+		}
+
+		// Skip empty messages early
+		if field.Kind() == protoreflect.MessageKind && !msg.Has(field) {
+			continue
+		}
+
 		switch {
 		case field.IsMap():
 			m, err := o.marshalMapValue(field, value)
 			if err != nil {
-				returnErr = err
-				return false
+				return nil, err
+			}
+			// Skip empty maps
+			if v, ok := m.([]bigquery.Value); ok && len(v) == 0 {
+				continue
 			}
 			result[string(field.Name())] = m
 		case field.IsList():
@@ -54,29 +73,28 @@ func (o MarshalOptions) marshalMessage(msg protoreflect.Message) (map[string]big
 			for i := 0; i < value.List().Len(); i++ {
 				f, err := o.marshalValue(field, value.List().Get(i))
 				if err != nil {
-					returnErr = err
-					return false
+					return nil, err
 				}
 				l = append(l, f)
 			}
+			// Skip empty lists
+			if len(l) == 0 {
+				continue
+			}
 			result[string(field.Name())] = l
 		default:
-			column, errMarshal := o.marshalValue(field, value)
-			if errMarshal != nil {
-				returnErr = errMarshal
-				return false
+			column, err := o.marshalValue(field, value)
+			if err != nil {
+				return nil, err
 			}
+			// Only skip empty messages/records, not primitive zero values
 			if m, ok := column.(map[string]bigquery.Value); ok && len(m) == 0 {
-				// don't set anything for empty records
-				return true
+				continue
 			}
 			result[string(field.Name())] = column
 		}
-		return true
-	})
-	if returnErr != nil {
-		return nil, returnErr
 	}
+
 	if o.Schema.UseOneofFields {
 		for i := 0; i < msg.Descriptor().Oneofs().Len(); i++ {
 			oneofDescriptor := msg.Descriptor().Oneofs().Get(i)
